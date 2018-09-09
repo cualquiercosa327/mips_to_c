@@ -7,7 +7,7 @@ from collections import Counter
 from parse_instruction import *
 from parse_file import *
 
-@attr.s
+@attr.s(cmp=False)
 class Block:
     index: int = attr.ib()
     label: Optional[Label] = attr.ib()
@@ -230,7 +230,7 @@ def is_loop_edge(node: 'Node', edge: 'Node'):
     # Loops are represented by backwards jumps.
     return edge.block.index < node.block.index
 
-@attr.s(frozen=True)
+@attr.s(frozen=True, cmp=False)
 class BasicNode:
     block: Block = attr.ib()
     successor: 'Node' = attr.ib()
@@ -249,7 +249,7 @@ class BasicNode:
             " (loop)" if self.is_loop() else ""])
 
 
-@attr.s(frozen=True)
+@attr.s(frozen=True, cmp=False)
 class ConditionalNode:
     block: Block = attr.ib()
     conditional_edge: 'Node' = attr.ib()  # forward-declare types
@@ -272,7 +272,7 @@ class ConditionalNode:
             f'def: {self.fallthrough_edge.block.index}'])
 
 
-@attr.s(frozen=True)
+@attr.s(frozen=True, cmp=False)
 class ReturnNode:
     block: Block = attr.ib()
     parents: List['Node'] = attr.ib(factory=list)
