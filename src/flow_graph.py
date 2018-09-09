@@ -1,7 +1,8 @@
 import attr
 
 import typing
-from typing import List, Union, Iterator, Optional, Dict, Set, Tuple, Callable, Any
+from typing import List, Union, Iterator, Optional, Dict, Set, Tuple, Counter, Callable, Any
+from collections import Counter
 
 from parse_instruction import *
 from parse_file import *
@@ -131,9 +132,66 @@ def prune_unreferenced_labels(function: Function) -> Function:
     return new_function
 
 
+# For each division or modulo operation, the IRIX compiler generates checks
+# for x/0 and INT_MIN/-1. This removes them.
+def prune_div_checks(function: Function) -> Function:
+    pattern : List[str] = [
+        "bnez",
+        "nop",
+        "break 7",
+        "",
+        "li $at, -1",
+        "bne",
+        "lui $at, 0x8000",
+        "bne",
+        "nop",
+        "break 6",
+        "",
+    ]
+
+    def match_one(actual, expected):
+        if not isinstance(actual, Instruction):
+            return expected == ""
+        if ' ' not in expected:
+            return actual.mnemonic == expected
+        return str(actual) == str(parse_instruction(expected))
+
+    def matches(actual):
+        if len(actual) != len(pattern):
+            return False
+        if not all(match_one(a, e) for (a, e) in zip(actual, pattern)):
+            return False
+        label1 = typing.cast(Label, actual[3])
+        label2 = typing.cast(Label, actual[10])
+        bnez = typing.cast(Instruction, actual[0])
+        bne1 = typing.cast(Instruction, actual[5])
+        bne2 = typing.cast(Instruction, actual[7])
+        return (bnez.get_branch_target().target == label1.name and
+                bne1.get_branch_target().target == label2.name and
+                bne2.get_branch_target().target == label2.name)
+
+    label_usages : Counter[str] = Counter()
+    for item in function.body:
+        if isinstance(item, Instruction) and item.is_branch_instruction():
+            label_usages[item.get_branch_target().target] += 1
+
+    new_function = Function(name=function.name)
+    i = 0
+    while i < len(function.body):
+        if matches(function.body[i:i + len(pattern)]):
+            i += len(pattern)
+            if label_usages[typing.cast(Label, function.body[i-1]).name] != 2:
+                i -= 1
+        else:
+            new_function.body.append(function.body[i])
+            i += 1
+    return new_function
+
+
 def build_blocks(function: Function) -> List[Block]:
     function = normalize_likely_branches(function)
     function = prune_unreferenced_labels(function)
+    function = prune_div_checks(function)
 
     block_builder = BlockBuilder()
 
