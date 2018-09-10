@@ -17,6 +17,7 @@ SPECIAL_REGS = [
 ]
 
 DEBUG = True
+IGNORE_ERRORS = False
 
 @attr.s
 class StackInfo:
@@ -693,9 +694,12 @@ def translate_graph_from_block(
         block_info = translate_block_body(node.block, reg, stack_info)
         if DEBUG:
             print(block_info)
-    except Exception as _:
-        traceback.print_exc()
-        block_info = BlockInfo([], None, {})  # TODO: handle issues
+    except Exception as e:
+        if IGNORE_ERRORS:
+            traceback.print_exc()
+            block_info = BlockInfo([], None, {})  # TODO: handle issues
+        else:
+            raise e
 
     node.block.add_block_info(block_info)
 
