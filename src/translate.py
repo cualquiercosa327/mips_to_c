@@ -1,5 +1,6 @@
 import attr
 import traceback
+import copy
 
 import typing
 from typing import List, Union, Iterator, Optional, Dict, Callable, Any
@@ -126,7 +127,7 @@ def get_stack_info(function: Function, start_node: Node) -> StackInfo:
     return info
 
 
-@attr.s
+@attr.s(frozen=True)
 class Store:
     size: int = attr.ib()
     source: 'Expression' = attr.ib()
@@ -137,7 +138,7 @@ class Store:
         type = f'(f{self.size})' if self.float else f'(s{self.size})'
         return f'{type} {self.dest} = {self.source}'
 
-@attr.s
+@attr.s(frozen=True)
 class TypeHint:
     type: str = attr.ib()
     value: 'Expression' = attr.ib()
@@ -145,11 +146,11 @@ class TypeHint:
     def __str__(self):
         return f'{self.type}({self.value})'
 
-@attr.s
+@attr.s(frozen=True)
 class BinaryOp:
-    left = attr.ib()
+    left: 'Expression' = attr.ib()
     op: str = attr.ib()
-    right = attr.ib()
+    right: 'Expression' = attr.ib()
 
     def is_boolean(self):
         return self.op in ['==', '!=', '>', '<', '>=', '<=']
@@ -182,28 +183,28 @@ class BinaryOp:
     def __str__(self):
         return f'({self.left} {self.op} {self.right})'
 
-@attr.s
+@attr.s(frozen=True)
 class UnaryOp:
     op: str = attr.ib()
-    expr = attr.ib()
+    expr: 'Expression' = attr.ib()
 
     def __str__(self):
         return f'{self.op}{self.expr}'
 
-@attr.s
+@attr.s(frozen=True)
 class Cast:
     to_type: str = attr.ib()
-    expr = attr.ib()
+    expr: 'Expression' = attr.ib()
 
     def __str__(self):
         return f'({self.to_type}) {self.expr}'
 
-@attr.s
+@attr.s(frozen=True)
 class Return:
     def __str__(self):
         return 'return'
 
-@attr.s
+@attr.s(frozen=True)
 class FuncCall:
     func_name: str = attr.ib()
     args: List['Expression'] = attr.ib()
@@ -224,7 +225,7 @@ def strip_macros(arg: Argument) -> Argument:
 def format_hex(val: int):
     return format(val, 'x').upper()
 
-@attr.s
+@attr.s(frozen=True)
 class LocalVar:
     value: int = attr.ib()
     # TODO: Definitely need type
@@ -232,7 +233,7 @@ class LocalVar:
     def __str__(self):
         return f'sp{format_hex(self.value)}'
 
-@attr.s
+@attr.s(frozen=True)
 class PassedInArg:
     value: int = attr.ib()
     # type?
@@ -240,7 +241,7 @@ class PassedInArg:
     def __str__(self):
         return f'arg{format_hex(self.value)}'
 
-@attr.s
+@attr.s(frozen=True)
 class StructAccess:
     struct_var = attr.ib()
     offset: int = attr.ib()
@@ -248,7 +249,7 @@ class StructAccess:
     def __str__(self):
         return f'{self.struct_var}->unk{format_hex(self.offset)}'
 
-@attr.s
+@attr.s(frozen=True)
 class SubroutineArg:
     value: int = attr.ib()
     # type?
@@ -269,6 +270,18 @@ Expression = Union[
     StructAccess,
     SubroutineArg,
 ]
+
+def replace_occurrences(expr: Expression, pattern: Expression, replacement: Expression):
+    if expr == pattern:
+        return replacement
+    new_expr = expr
+    if any(isinstance(expr, t) for t in [BinaryOp, UnaryOp, Cast, FuncCall]):
+        for k,v in expr.__dict__.items():
+            v2 = replace_occurrences(v, pattern, replacement)
+            if v != v2:
+                new_expr = copy.copy(new_expr)
+                new_expr.__dict__[k] = v2
+    return new_expr
 
 @attr.s
 class RegInfo:
@@ -298,6 +311,10 @@ class RegInfo:
             assert reg != Register('zero')
             if reg in self.contents:
                 del self.contents[reg]
+
+    def replace_occurrences(self, pattern: Expression, replacement: Expression):
+        for k,v in self.contents.items():
+            self.contents[k] = replace_occurrences(v, pattern, replacement)
 
     def copy(self: 'RegInfo'):
         return RegInfo(contents=self.contents.copy())
@@ -623,6 +640,15 @@ def translate_block_body(
                     stack_info.add_local_var(to_store.dest)
                 # This needs to be written out.
                 to_write.append(to_store)
+                # If the expression is used again, read it from memory instead of
+                # duplicating it -- duplicated C expressions are probably rare,
+                # and the expression might be invalidated sooner (e.g. if it
+                # refers to the store destination).
+                if not isinstance(to_store.source, NumberLiteral):
+                    regs.replace_occurrences(to_store.source, to_store.dest)
+                    subroutine_args = [
+                        (replace_occurrences(val, to_store.source, to_store.dest), pos)
+                        for (val, pos) in subroutine_args]
 
         elif mnemonic in cases_source_first_register:
             # Just 'mtc1'. It's reversed, so we have to specially handle it.
