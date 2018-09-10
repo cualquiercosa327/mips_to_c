@@ -289,8 +289,8 @@ def handle_return(
     context: Context, body: Body, return_node: Node, indent: int
 ):
     ret_info = return_node.block.block_info
-    if ret_info and Register('v0') in ret_info.final_register_states:
-        ret = ret_info.final_register_states[Register('v0')]
+    if ret_info and Register('return_reg') in ret_info.final_register_states:
+        ret = ret_info.final_register_states[Register('return_reg')]
         stmt = Statement(indent, f'// (possible return value: {ret})',
                 is_comment=True)
         body.add_statement(stmt)
