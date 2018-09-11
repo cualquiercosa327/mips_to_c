@@ -277,7 +277,7 @@ class EvalOnceStmt:
         return self.expr.num_usages != 1
 
     def __str__(self: 'EvalOnceStmt'):
-        return f'{self.expr.get_var_name()} = {self.expr.expr}'
+        return f'{self.expr.get_var_name()} = {self.expr.expr};'
 
 @attr.s
 class FuncCallStmt:
@@ -287,7 +287,7 @@ class FuncCallStmt:
         return True
 
     def __str__(self: 'FuncCallStmt'):
-        return str(self.expr)
+        return f'{self.expr};'
 
 @attr.s
 class StoreStmt:
@@ -301,7 +301,7 @@ class StoreStmt:
 
     def __str__(self: 'StoreStmt'):
         type = f'(f{self.size})' if self.float else f'(s{self.size})'
-        return f'{type} {self.dest} = {self.source}'
+        return f'{type} {self.dest} = {self.source};'
 
 Expression = Union[
     BinaryOp,
