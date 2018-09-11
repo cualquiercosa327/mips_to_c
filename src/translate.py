@@ -537,6 +537,7 @@ def translate_block_body(
         'cvt.d.s': lambda a: Cast(to_type='f64', expr=regs[a[1]]),
         'cvt.s.d': lambda a: Cast(to_type='f32', expr=regs[a[1]]),
         'cvt.w.d': lambda a: Cast(to_type='s32', expr=regs[a[1]]),
+        'cvt.s.u': lambda a: Cast(to_type='f32', expr=Cast(to_type='u32', expr=regs[a[1]])),
         'trunc.w.s': lambda a: Cast(to_type='s32', expr=regs[a[1]]),
         'trunc.w.d': lambda a: Cast(to_type='s32', expr=regs[a[1]]),
         # Bit arithmetic

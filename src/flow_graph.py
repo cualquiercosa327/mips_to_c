@@ -132,10 +132,12 @@ def prune_unreferenced_labels(function: Function) -> Function:
     return new_function
 
 
-# For each division or modulo operation, the IRIX compiler generates checks
-# for x/0 and INT_MIN/-1. This removes them.
-def prune_div_checks(function: Function) -> Function:
-    pattern : List[str] = [
+# Detect and simplify various standard patterns emitted by the IRIX compiler.
+# Currently handled:
+# - checks for x/0 and INT_MIN/-1 after division (removed)
+# - unsigned to float conversion (converted to a made-up instruction)
+def simplify_standard_patterns(function: Function) -> Function:
+    div_pattern: List[str] = [
         "bnez",
         "nop",
         "break 7",
@@ -149,49 +151,78 @@ def prune_div_checks(function: Function) -> Function:
         "",
     ]
 
-    def match_one(actual, expected):
-        if not isinstance(actual, Instruction):
-            return expected == ""
-        if ' ' not in expected:
-            return actual.mnemonic == expected
-        return str(actual) == str(parse_instruction(expected))
+    utf_pattern: List[str] = [
+        "bgez",
+        "cvt.s.w",
+        "lui $at, 0x4f80",
+        "mtc1",
+        "nop",
+        "add.s",
+        "",
+    ]
 
-    def matches(actual):
-        if len(actual) != len(pattern):
-            return False
-        if not all(match_one(a, e) for (a, e) in zip(actual, pattern)):
-            return False
+    def matches_pattern(actual, pattern):
+        def match_one(actual, expected):
+            if not isinstance(actual, Instruction):
+                return expected == ""
+            ins = parse_instruction(expected)
+            if not ins.args:
+                return actual.mnemonic == ins.mnemonic
+            if str(actual) == str(ins):
+                return True
+            # A bit of a awful hack, but this allows both li and lui.
+            return (ins.mnemonic == 'lui' and actual.mnemonic == 'li' and
+                    str(actual.args[0]) == str(ins.args[0]) and
+                    isinstance(actual.args[1], NumberLiteral) and
+                    isinstance(ins.args[1], NumberLiteral) and
+                    actual.args[1].value == ins.args[1].value << 16)
+
+        return (len(actual) == len(pattern) and
+            all(match_one(a, e) for (a, e) in zip(actual, pattern)))
+
+    def try_replace_div(i) -> Optional[Tuple[List[Instruction], int]]:
+        actual = function.body[i:i + len(div_pattern)]
+        if not matches_pattern(actual, div_pattern):
+            return None
         label1 = typing.cast(Label, actual[3])
         label2 = typing.cast(Label, actual[10])
         bnez = typing.cast(Instruction, actual[0])
         bne1 = typing.cast(Instruction, actual[5])
         bne2 = typing.cast(Instruction, actual[7])
-        return (bnez.get_branch_target().target == label1.name and
+        if (bnez.get_branch_target().target == label1.name or
                 bne1.get_branch_target().target == label2.name and
-                bne2.get_branch_target().target == label2.name)
+                bne2.get_branch_target().target == label2.name):
+            return None
+        return ([], i + len(div_pattern) - 1)
 
-    label_usages : Counter[str] = Counter()
-    for item in function.body:
-        if isinstance(item, Instruction) and item.is_branch_instruction():
-            label_usages[item.get_branch_target().target] += 1
+    def try_replace_utf_conv(i) -> Optional[Tuple[List[Instruction], int]]:
+        actual = function.body[i:i + len(utf_pattern)]
+        if not matches_pattern(actual, utf_pattern):
+            return None
+        label = typing.cast(Label, actual[6])
+        bgez = typing.cast(Instruction, actual[0])
+        if bgez.get_branch_target().target != label.name:
+            return None
+        cvt_instr = typing.cast(Instruction, actual[1])
+        new_instr = Instruction(mnemonic="cvt.s.u", args=cvt_instr.args)
+        return ([new_instr], i + len(utf_pattern) - 1)
+
+    def no_replacement(i) -> Tuple[List[Instruction], int]:
+        return ([function.body[i]], i + 1)
 
     new_function = Function(name=function.name)
     i = 0
     while i < len(function.body):
-        if matches(function.body[i:i + len(pattern)]):
-            i += len(pattern)
-            if label_usages[typing.cast(Label, function.body[i-1]).name] != 2:
-                i -= 1
-        else:
-            new_function.body.append(function.body[i])
-            i += 1
+        repl, i = try_replace_div(i) or try_replace_utf_conv(i) or no_replacement(i)
+        new_function.body.extend(repl)
     return new_function
 
 
 def build_blocks(function: Function) -> List[Block]:
     function = normalize_likely_branches(function)
     function = prune_unreferenced_labels(function)
-    function = prune_div_checks(function)
+    function = simplify_standard_patterns(function)
+    function = prune_unreferenced_labels(function)
 
     block_builder = BlockBuilder()
 
