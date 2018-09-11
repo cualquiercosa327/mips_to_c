@@ -9,18 +9,19 @@ from parse_instruction import *
 from flow_graph import *
 from parse_file import *
 
-# TODO: include temporary floating-point registers
-CALLER_SAVE_REGS = [
+ARGUMENT_REGS = [
     'a0', 'a1', 'a2', 'a3',
     'f12', 'f14',
+]
+
+# TODO: include temporary floating-point registers
+CALLER_SAVE_REGS = ARGUMENT_REGS + [
     'at',
     't0', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9',
     'hi', 'lo', 'condition_bit', 'return_reg'
 ]
 
 SPECIAL_REGS = [
-    'a0', 'a1', 'a2', 'a3',
-    'f12', 'f14',
     's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7',
     'ra',
     '31'
@@ -39,6 +40,7 @@ class StackInfo:
     return_addr_location: int = attr.ib(default=0)
     callee_save_reg_locations: Dict[Register, int] = attr.ib(factory=dict)
     local_vars: List['LocalVar'] = attr.ib(factory=list)
+    arguments: List['PassedInArg'] = attr.ib(factory=list)
     temp_name_counter: Dict[str, int] = attr.ib(factory=dict)
 
     def temp_var_generator(self, prefix: str, type: str) -> Callable[[], str]:
@@ -65,9 +67,17 @@ class StackInfo:
         return location >= self.allocated_stack_size
 
     def add_local_var(self, var: 'LocalVar'):
+        if var in self.local_vars:
+            return
         self.local_vars.append(var)
         # Make sure the local vars stay sorted in order on the stack.
         self.local_vars.sort(key=lambda v: v.value)
+
+    def add_argument(self, arg: 'PassedInArg'):
+        if arg in self.arguments:
+            return
+        self.arguments.append(arg)
+        self.arguments.sort(key=lambda a: a.value)
 
     def __str__(self):
         return '\n'.join([
@@ -224,7 +234,11 @@ class LocalVar:
 @attr.s(frozen=True)
 class PassedInArg:
     value: int = attr.ib()
-    # type?
+    type: Optional[str] = attr.ib(default=None)
+
+    def declaration_str(self) -> str:
+        type_str = '' if self.type is None else self.type + ' '
+        return f'{type_str}{self}'
 
     def __str__(self):
         return f'arg{format_hex(self.value)}'
@@ -268,6 +282,13 @@ class EvalOnceExpr:
             return str(self.expr)
         else:
             return self.get_var_name()
+
+@attr.s(frozen=True)
+class WrapperExpr:
+    wrapped_expr: 'Expression' = attr.ib()
+
+    def __str__(self) -> str:
+        return str(self.wrapped_expr)
 
 @attr.s
 class EvalOnceStmt:
@@ -326,6 +347,7 @@ Expression = Union[
     StructAccess,
     SubroutineArg,
     EvalOnceExpr,
+    WrapperExpr,
 ]
 
 Statement = Union[
@@ -336,6 +358,8 @@ Statement = Union[
 ]
 
 def is_trivial_expr(expr: Optional[Expression]) -> bool:
+    if isinstance(expr, WrapperExpr):
+        return is_trivial_expr(expr.wrapped_expr)
     trivial_types = [EvalOnceExpr, NumberLiteral, FloatLiteral, GlobalSymbol,
             LocalVar, PassedInArg, SubroutineArg]
     return expr is None or any(isinstance(expr, t) for t in trivial_types)
@@ -354,12 +378,15 @@ def replace_occurrences(expr: Expression, pattern: Expression, replacement: Expr
 
 @attr.s
 class RegInfo:
-    contents: Dict[Register, Expression] = attr.ib(factory=dict)
+    contents: Dict[Register, Expression] = attr.ib()
+    stack_info: StackInfo = attr.ib()
 
     def __getitem__(self, key: Register):
         ret = self.contents[key]
         if isinstance(ret, EvalOnceExpr):
             ret.num_usages += 1
+        if isinstance(ret, PassedInArg):
+            self.stack_info.add_argument(ret)
         return ret
 
     def __contains__(self, key: Register):
@@ -389,7 +416,7 @@ class RegInfo:
             self.contents[k] = replace_occurrences(v, pattern, replacement)
 
     def copy(self: 'RegInfo'):
-        return RegInfo(contents=self.contents.copy())
+        return RegInfo(contents=self.contents.copy(), stack_info=self.stack_info)
 
     def __str__(self: 'RegInfo'):
         return ', '.join(f"{k}: {v}" for k,v in sorted(self.contents.items()))
@@ -491,7 +518,7 @@ class BlockInfo:
 
 def make_store(args: List[Argument], regs: RegInfo, stack_info: StackInfo, size: int, float=False) -> Optional[StoreStmt]:
     assert isinstance(args[0], Register)
-    if (args[0].register_name in SPECIAL_REGS and
+    if (args[0].register_name in (SPECIAL_REGS + ARGUMENT_REGS) and
             isinstance(args[1], AddressMode) and
             args[1].rhs.register_name == 'sp'):
         # TODO: This isn't really right, but it helps get rid of some pointless stores.
@@ -690,6 +717,10 @@ def translate_block_body(
             type = 'float' if reg.is_float_reg() else 'int'
             value = EvalOnceExpr(value, var=stack_info.temp_var_generator(reg.register_name, type))
             to_write.append(EvalOnceStmt(value))
+        if isinstance(value, PassedInArg):
+            # Wrap the argument to better distinguish arguments we are called
+            # with from arguments passed to subroutines.
+            value = WrapperExpr(value)
         regs[reg] = value
 
     subroutine_args: List[Tuple[Expression, int]] = []
@@ -718,9 +749,7 @@ def translate_block_body(
                 # About to call a subroutine with this argument.
                 subroutine_args.append((to_store.source, to_store.dest.value))
             elif to_store is not None:
-                if (isinstance(to_store.dest, LocalVar) and
-                    to_store.dest not in stack_info.local_vars):
-                    # Keep track of all local variables.
+                if isinstance(to_store.dest, LocalVar):
                     stack_info.add_local_var(to_store.dest)
                 # This needs to be written out.
                 to_write.append(to_store)
@@ -765,16 +794,22 @@ def translate_block_body(
                 # Function call. Well, let's double-check:
                 assert mnemonic == 'jal'
                 assert isinstance(args[0], GlobalSymbol)
-                func_args = []
+                func_args: List[Expression] = []
                 # At most one of $f12 and $a0 may be passed, and at most one of
                 # $f14 and $a1. We could try to figure out which ones, and cap
                 # the function call at the point where a register is empty, but
                 # for now we'll leave that for manual fixup.
                 for register in map(Register, ['f12', 'f14', 'a0', 'a1', 'a2', 'a3']):
                     # The latter check verifies that the register is not a
-                    # placeholder.
-                    if register in regs and regs[register] != GlobalSymbol(register.register_name):
-                        func_args.append(regs[register])
+                    # placeholder. This might give false positives for the
+                    # first function call if an argument passed in the same
+                    # position as we received it, but that's impossible to do
+                    # anything about without access to function signatures.
+                    # (In other cases PassedInArg's get wrapped by WrapperExpr.)
+                    if register in regs:
+                        expr = regs[register]
+                        if not isinstance(expr, PassedInArg):
+                            func_args.append(expr)
                 # Add the arguments after a3.
                 subroutine_args.sort(key=lambda a: a[1])
                 for arg in subroutine_args:
@@ -851,7 +886,8 @@ def translate_graph_from_block(
         if IGNORE_ERRORS:
             traceback.print_exc()
             error_stmt = CommentStmt('Error: ' + str(e).replace('\n', ''))
-            block_info = BlockInfo([error_stmt], None, RegInfo(contents={}))
+            block_info = BlockInfo([error_stmt], None,
+                    RegInfo(contents={}, stack_info=stack_info))
         else:
             raise e
 
@@ -882,15 +918,20 @@ def translate_to_ast(function: Function) -> FunctionInfo:
     flow_graph: FlowGraph = build_callgraph(function)
     stack_info = get_stack_info(function, flow_graph.nodes[0])
 
+    initial_regs: Dict[Register, Expression] = {
+        Register('zero'): NumberLiteral(0),
+        Register('a0'): PassedInArg(0, 'int'),
+        Register('a1'): PassedInArg(1, 'int'),
+        Register('a2'): PassedInArg(2),
+        Register('a3'): PassedInArg(3),
+        Register('f12'): PassedInArg(0, 'float'),
+        Register('f14'): PassedInArg(1, 'float'),
+        **{Register(name): GlobalSymbol(name) for name in SPECIAL_REGS}
+    }
+
     print(stack_info)
     print('\nNow, we attempt to translate:')
     start_node = flow_graph.nodes[0]
-    start_reg: RegInfo = RegInfo(contents={
-        Register('zero'): NumberLiteral(0),
-        # Add dummy values for callee-save registers and args.
-        # TODO: There's a better way to do this; this is screwing up the
-        # arguments to function calls.
-        **{Register(name): GlobalSymbol(name) for name in SPECIAL_REGS}
-    })
+    start_reg = RegInfo(contents=initial_regs, stack_info=stack_info)
     translate_graph_from_block(start_node, start_reg, stack_info)
     return FunctionInfo(stack_info, flow_graph)

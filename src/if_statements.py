@@ -362,7 +362,9 @@ def write_function(function_info: FunctionInfo) -> None:
     if context.can_reach_return:
         handle_return(context, body, return_node, 4)
 
-    print(f'{function_info.stack_info.function.name}(...) {{')
+    fn_name = function_info.stack_info.function.name
+    args = ', '.join(a.declaration_str() for a in function_info.stack_info.arguments)
+    print(f'{fn_name}({args}) {{')
     for local_var in function_info.stack_info.local_vars:
         print(f'    (???) {local_var};')
     print(body)
