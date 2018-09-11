@@ -303,6 +303,16 @@ class StoreStmt:
         type = f'(f{self.size})' if self.float else f'(s{self.size})'
         return f'{type} {self.dest} = {self.source};'
 
+@attr.s
+class CommentStmt:
+    contents: str = attr.ib()
+
+    def should_write(self):
+        return True
+
+    def __str__(self):
+        return f'// {self.contents}'
+
 Expression = Union[
     BinaryOp,
     UnaryOp,
@@ -322,6 +332,7 @@ Statement = Union[
     StoreStmt,
     FuncCallStmt,
     EvalOnceStmt,
+    CommentStmt,
 ]
 
 def is_trivial_expr(expr: Optional[Expression]) -> bool:
@@ -836,10 +847,11 @@ def translate_graph_from_block(
         block_info = translate_block_body(node.block, regs, stack_info)
         if DEBUG:
             print(block_info)
-    except Exception as e:
+    except Exception as e:  # TODO: handle issues better
         if IGNORE_ERRORS:
             traceback.print_exc()
-            block_info = BlockInfo([], None, RegInfo())  # TODO: handle issues
+            error_stmt = CommentStmt('Error: ' + str(e).replace('\n', ''))
+            block_info = BlockInfo([error_stmt], None, RegInfo(contents={}))
         else:
             raise e
 
