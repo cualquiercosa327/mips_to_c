@@ -29,6 +29,7 @@ SPECIAL_REGS = [
 DEBUG = True
 IGNORE_ERRORS = False
 
+
 @attr.s
 class StackInfo:
     function: Function = attr.ib()
@@ -126,6 +127,9 @@ def get_stack_info(function: Function, start_node: Node) -> StackInfo:
     # Done.
     return info
 
+def format_hex(val: int) -> str:
+    return format(val, 'x').upper()
+
 
 @attr.s(frozen=True)
 class Store:
@@ -212,19 +216,6 @@ class FuncCall:
     def __str__(self):
         return f'{self.func_name}({", ".join(str(arg) for arg in self.args)})'
 
-
-def strip_macros(arg: Argument) -> Argument:
-    if isinstance(arg, Macro):
-        return arg.argument
-    elif isinstance(arg, AddressMode) and isinstance(arg.lhs, Macro):
-        assert arg.lhs.macro_name == 'lo'  # %hi(...)(REG) doesn't make sense.
-        return arg.lhs.argument
-    else:
-        return arg
-
-def format_hex(val: int):
-    return format(val, 'x').upper()
-
 @attr.s(frozen=True)
 class LocalVar:
     value: int = attr.ib()
@@ -257,6 +248,14 @@ class SubroutineArg:
     def __str__(self):
         return f'subroutine_arg{format_hex(self.value)}'
 
+@attr.s(frozen=True)
+class FloatLiteral:
+    val: float = attr.ib()
+
+    def __str__(self):
+        return str(self.val)
+
+
 Expression = Union[
     BinaryOp,
     UnaryOp,
@@ -265,6 +264,7 @@ Expression = Union[
     Register,
     GlobalSymbol,
     NumberLiteral,
+    FloatLiteral,
     LocalVar,
     PassedInArg,
     StructAccess,
@@ -438,18 +438,20 @@ def convert_to_float(num: int):
     frac = dec(rep[9:])
     return ((-1) ** sign) * (2 ** (expo - 127)) * (frac / (2 ** 23) + 1)
 
-@attr.s
-class FloatLiteral:
-    val: float = attr.ib()
-
-    def __str__(self):
-        return str(self.val)
-
-def handle_mtc1(source):
+def handle_mtc1(source: Expression) -> Expression:
     if isinstance(source, NumberLiteral):
         return FloatLiteral(convert_to_float(source.value))
     else:
         return source
+
+def strip_macros(arg: Argument) -> Argument:
+    if isinstance(arg, Macro):
+        return arg.argument
+    elif isinstance(arg, AddressMode) and isinstance(arg.lhs, Macro):
+        assert arg.lhs.macro_name == 'lo'  # %hi(...)(REG) doesn't make sense.
+        return arg.lhs.argument
+    else:
+        return arg
 
 
 def translate_block_body(
