@@ -384,7 +384,7 @@ def handle_ori(args: List[Argument], regs: RegInfo) -> Expression:
 
 def handle_addi(args: List[Argument], regs: RegInfo) -> Expression:
     if len(args) == 2:
-        # Used to be "addi REG %lo(...)", but we got rid of the macro.
+        # Used to be "addi reg1 reg2 %lo(...)", but we got rid of the macro.
         # Return the former argument of the macro.
         return literal_expr(args[1])
     else:
@@ -627,6 +627,8 @@ def translate_block_body(
         # full value into each intermediate register, because this really
         # doesn't affect program behavior almost ever.
         args = list(map(strip_macros, instr.args))
+        if mnemonic in ['addi', 'addiu'] and len(args) == 3 and isinstance(instr.args[2], Macro):
+            del args[1]
 
         # Figure out what code to generate!
         if mnemonic in cases_source_first_expression:
