@@ -66,20 +66,20 @@ class StackInfo:
     def location_above_stack(self, location: int) -> bool:
         return location >= self.allocated_stack_size
 
-    def add_local_var(self, var: 'LocalVar'):
+    def add_local_var(self, var: 'LocalVar') -> None:
         if var in self.local_vars:
             return
         self.local_vars.append(var)
         # Make sure the local vars stay sorted in order on the stack.
         self.local_vars.sort(key=lambda v: v.value)
 
-    def add_argument(self, arg: 'PassedInArg'):
+    def add_argument(self, arg: 'PassedInArg') -> None:
         if arg in self.arguments:
             return
         self.arguments.append(arg)
         self.arguments.sort(key=lambda a: a.value)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return '\n'.join([
             f'Stack info for function {self.function.name}:',
             f'Allocated stack size: {self.allocated_stack_size}',
@@ -154,7 +154,7 @@ class TypeHint:
     type: str = attr.ib()
     value: 'Expression' = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'{self.type}({self.value})'
 
 @attr.s(frozen=True)
@@ -163,7 +163,7 @@ class BinaryOp:
     op: str = attr.ib()
     right: 'Expression' = attr.ib()
 
-    def is_boolean(self):
+    def is_boolean(self) -> bool:
         return self.op in ['==', '!=', '>', '<', '>=', '<=']
 
     def negated(self) -> 'BinaryOp':
@@ -191,7 +191,7 @@ class BinaryOp:
                 return self.left.simplify()
         return self
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'({self.left} {self.op} {self.right})'
 
 @attr.s(frozen=True)
@@ -199,7 +199,7 @@ class UnaryOp:
     op: str = attr.ib()
     expr: 'Expression' = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'{self.op}{self.expr}'
 
 @attr.s(frozen=True)
@@ -207,12 +207,12 @@ class Cast:
     to_type: str = attr.ib()
     expr: 'Expression' = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'({self.to_type}) {self.expr}'
 
 @attr.s(frozen=True)
 class Return:
-    def __str__(self):
+    def __str__(self) -> str:
         return 'return'
 
 @attr.s(frozen=True)
@@ -220,7 +220,7 @@ class FuncCall:
     func_name: str = attr.ib()
     args: List['Expression'] = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'{self.func_name}({", ".join(str(arg) for arg in self.args)})'
 
 @attr.s(frozen=True)
@@ -228,7 +228,7 @@ class LocalVar:
     value: int = attr.ib()
     # TODO: Definitely need type
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'sp{format_hex(self.value)}'
 
 @attr.s(frozen=True)
@@ -240,7 +240,7 @@ class PassedInArg:
         type_str = '' if self.type is None else self.type + ' '
         return f'{type_str}{self}'
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'arg{format_hex(self.value)}'
 
 @attr.s(frozen=True)
@@ -248,7 +248,7 @@ class StructAccess:
     struct_var = attr.ib()
     offset: int = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'{self.struct_var}->unk{format_hex(self.offset)}'
 
 @attr.s(frozen=True)
@@ -256,14 +256,14 @@ class SubroutineArg:
     value: int = attr.ib()
     # type?
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'subroutine_arg{format_hex(self.value)}'
 
 @attr.s(frozen=True)
 class FloatLiteral:
     val: float = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return str(self.val)
 
 @attr.s(cmp=False)
@@ -272,12 +272,12 @@ class EvalOnceExpr:
     var: Union[str, Callable[[], str]] = attr.ib()
     num_usages: int = attr.ib(default=0)
 
-    def get_var_name(self: 'EvalOnceExpr') -> str:
+    def get_var_name(self) -> str:
         if not isinstance(self.var, str):
             self.var = self.var()
         return self.var
 
-    def __str__(self: 'EvalOnceExpr'):
+    def __str__(self) -> str:
         if self.num_usages == 1:
             return str(self.expr)
         else:
@@ -294,20 +294,20 @@ class WrapperExpr:
 class EvalOnceStmt:
     expr: EvalOnceExpr = attr.ib()
 
-    def should_write(self: 'EvalOnceStmt'):
+    def should_write(self) -> bool:
         return self.expr.num_usages != 1
 
-    def __str__(self: 'EvalOnceStmt'):
+    def __str__(self) -> str:
         return f'{self.expr.get_var_name()} = {self.expr.expr};'
 
 @attr.s
 class FuncCallStmt:
     expr: EvalOnceExpr = attr.ib()
 
-    def should_write(self: 'FuncCallStmt'):
+    def should_write(self) -> bool:
         return True
 
-    def __str__(self: 'FuncCallStmt'):
+    def __str__(self) -> str:
         return f'{self.expr};'
 
 @attr.s
@@ -317,10 +317,10 @@ class StoreStmt:
     dest: 'Expression' = attr.ib()
     float: bool = attr.ib(default=False)
 
-    def should_write(self: 'StoreStmt'):
+    def should_write(self) -> bool:
         return True
 
-    def __str__(self: 'StoreStmt'):
+    def __str__(self) -> str:
         type = f'(f{self.size})' if self.float else f'(s{self.size})'
         return f'{type} {self.dest} = {self.source};'
 
@@ -328,10 +328,10 @@ class StoreStmt:
 class CommentStmt:
     contents: str = attr.ib()
 
-    def should_write(self):
+    def should_write(self) -> bool:
         return True
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f'// {self.contents}'
 
 Expression = Union[
@@ -381,7 +381,7 @@ class RegInfo:
     contents: Dict[Register, Expression] = attr.ib()
     stack_info: StackInfo = attr.ib()
 
-    def __getitem__(self, key: Register):
+    def __getitem__(self, key: Register) -> Expression:
         ret = self.contents[key]
         if isinstance(ret, EvalOnceExpr):
             ret.num_usages += 1
@@ -389,10 +389,10 @@ class RegInfo:
             self.stack_info.add_argument(ret)
         return ret
 
-    def __contains__(self, key: Register):
+    def __contains__(self, key: Register) -> bool:
         return key in self.contents
 
-    def __setitem__(self, key: Register, value: Optional[Expression]):
+    def __setitem__(self, key: Register, value: Optional[Expression]) -> None:
         assert key != Register('zero')
         if value is not None:
             self.contents[key] = value
@@ -401,11 +401,11 @@ class RegInfo:
         if key.register_name in ['f0', 'v0']:
             self[Register('return_reg')] = value
 
-    def __delitem__(self, key: Register):
+    def __delitem__(self, key: Register) -> None:
         assert key != Register('zero')
         del self.contents[key]
 
-    def clear_caller_save_regs(self: 'RegInfo'):
+    def clear_caller_save_regs(self) -> None:
         for reg in map(Register, CALLER_SAVE_REGS):
             assert reg != Register('zero')
             if reg in self.contents:
@@ -415,10 +415,10 @@ class RegInfo:
         for k,v in self.contents.items():
             self.contents[k] = replace_occurrences(v, pattern, replacement)
 
-    def copy(self: 'RegInfo'):
+    def copy(self) -> 'RegInfo':
         return RegInfo(contents=self.contents.copy(), stack_info=self.stack_info)
 
-    def __str__(self: 'RegInfo'):
+    def __str__(self) -> str:
         return ', '.join(f"{k}: {v}" for k,v in sorted(self.contents.items()))
 
 
@@ -508,7 +508,7 @@ class BlockInfo:
     branch_condition: Optional[Expression] = attr.ib()
     final_register_states: RegInfo = attr.ib()
 
-    def __str__(self):
+    def __str__(self) -> str:
         newline = '\n\t'
         return '\n'.join([
             f'To write: {newline.join(str(write) for write in self.to_write if write.should_write())}',
