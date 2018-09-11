@@ -60,7 +60,8 @@ class Body:
         # Add node contents
         assert node.block.block_info is not None
         for item in node.block.block_info.to_write:
-            self.statements.append(Statement(indent, str(item)))
+            if item.should_write():
+                self.statements.append(Statement(indent, str(item)))
 
     def add_statement(self, statement: Statement):
         self.statements.append(statement)

@@ -39,6 +39,14 @@ class StackInfo:
     return_addr_location: int = attr.ib(default=0)
     callee_save_reg_locations: Dict[Register, int] = attr.ib(factory=dict)
     local_vars: List['LocalVar'] = attr.ib(factory=list)
+    temp_name_counter: Dict[str, int] = attr.ib(factory=dict)
+
+    def temp_var_generator(self, prefix: str, type: str) -> Callable[[], str]:
+        def gen() -> str:
+            counter = self.temp_name_counter.get(prefix, 0) + 1
+            self.temp_name_counter[prefix] = counter
+            return f'temp_{prefix}' + (f'_{counter}' if counter > 1 else '')
+        return gen
 
     def in_subroutine_arg_region(self, location: int) -> bool:
         assert not self.is_leaf
@@ -130,17 +138,6 @@ def get_stack_info(function: Function, start_node: Node) -> StackInfo:
 def format_hex(val: int) -> str:
     return format(val, 'x').upper()
 
-
-@attr.s(frozen=True)
-class Store:
-    size: int = attr.ib()
-    source: 'Expression' = attr.ib()
-    dest: 'Expression' = attr.ib()
-    float: bool = attr.ib(default=False)
-
-    def __str__(self):
-        type = f'(f{self.size})' if self.float else f'(s{self.size})'
-        return f'{type} {self.dest} = {self.source}'
 
 @attr.s(frozen=True)
 class TypeHint:
@@ -255,13 +252,62 @@ class FloatLiteral:
     def __str__(self):
         return str(self.val)
 
+@attr.s(cmp=False)
+class EvalOnceExpr:
+    expr: 'Expression' = attr.ib()
+    var: Union[str, Callable[[], str]] = attr.ib()
+    num_usages: int = attr.ib(default=0)
+
+    def get_var_name(self: 'EvalOnceExpr') -> str:
+        if not isinstance(self.var, str):
+            self.var = self.var()
+        return self.var
+
+    def __str__(self: 'EvalOnceExpr'):
+        if self.num_usages == 1:
+            return str(self.expr)
+        else:
+            return self.get_var_name()
+
+@attr.s
+class EvalOnceStmt:
+    expr: EvalOnceExpr = attr.ib()
+
+    def should_write(self: 'EvalOnceStmt'):
+        return self.expr.num_usages != 1
+
+    def __str__(self: 'EvalOnceStmt'):
+        return f'{self.expr.get_var_name()} = {self.expr.expr}'
+
+@attr.s
+class FuncCallStmt:
+    expr: EvalOnceExpr = attr.ib()
+
+    def should_write(self: 'FuncCallStmt'):
+        return True
+
+    def __str__(self: 'FuncCallStmt'):
+        return str(self.expr)
+
+@attr.s
+class StoreStmt:
+    size: int = attr.ib()
+    source: 'Expression' = attr.ib()
+    dest: 'Expression' = attr.ib()
+    float: bool = attr.ib(default=False)
+
+    def should_write(self: 'StoreStmt'):
+        return True
+
+    def __str__(self: 'StoreStmt'):
+        type = f'(f{self.size})' if self.float else f'(s{self.size})'
+        return f'{type} {self.dest} = {self.source}'
 
 Expression = Union[
     BinaryOp,
     UnaryOp,
     Cast,
     FuncCall,
-    Register,
     GlobalSymbol,
     NumberLiteral,
     FloatLiteral,
@@ -269,7 +315,19 @@ Expression = Union[
     PassedInArg,
     StructAccess,
     SubroutineArg,
+    EvalOnceExpr,
 ]
+
+Statement = Union[
+    StoreStmt,
+    FuncCallStmt,
+    EvalOnceStmt,
+]
+
+def is_trivial_expr(expr: Optional[Expression]) -> bool:
+    trivial_types = [EvalOnceExpr, NumberLiteral, FloatLiteral, GlobalSymbol,
+            LocalVar, PassedInArg, SubroutineArg]
+    return expr is None or any(isinstance(expr, t) for t in trivial_types)
 
 def replace_occurrences(expr: Expression, pattern: Expression, replacement: Expression):
     if expr == pattern:
@@ -288,7 +346,10 @@ class RegInfo:
     contents: Dict[Register, Expression] = attr.ib(factory=dict)
 
     def __getitem__(self, key: Register):
-        return self.contents[key]
+        ret = self.contents[key]
+        if isinstance(ret, EvalOnceExpr):
+            ret.num_usages += 1
+        return ret
 
     def __contains__(self, key: Register):
         return key in self.contents
@@ -346,7 +407,7 @@ def deref(arg: Argument, regs: RegInfo, stack_info: StackInfo) -> Expression:
             # Struct member is being dereferenced.
             return StructAccess(struct_var=regs[arg.rhs], offset=location)
     else:
-        # Keep GlobalSymbols as-is.
+        # Keep GlobalSymbol's as-is.
         assert isinstance(arg, GlobalSymbol)
         return arg
 
@@ -405,26 +466,26 @@ class BlockInfo:
     Contains translated assembly code (to_write), the block's branch condition,
     and block's final register states.
     """
-    to_write: List[Union[Store, FuncCall]] = attr.ib()
+    to_write: List[Statement] = attr.ib()
     branch_condition: Optional[Expression] = attr.ib()
     final_register_states: RegInfo = attr.ib()
 
     def __str__(self):
         newline = '\n\t'
         return '\n'.join([
-            f'To write: {newline.join(str(write) for write in self.to_write)}',
+            f'To write: {newline.join(str(write) for write in self.to_write if write.should_write())}',
             f'Branch condition: {self.branch_condition}',
             f'Final register states: {self.final_register_states}'])
 
 
-def make_store(args: List[Argument], regs: RegInfo, stack_info: StackInfo, size: int, float=False):
+def make_store(args: List[Argument], regs: RegInfo, stack_info: StackInfo, size: int, float=False) -> Optional[StoreStmt]:
     assert isinstance(args[0], Register)
     if (args[0].register_name in SPECIAL_REGS and
             isinstance(args[1], AddressMode) and
             args[1].rhs.register_name == 'sp'):
         # TODO: This isn't really right, but it helps get rid of some pointless stores.
         return None
-    return Store(
+    return StoreStmt(
         size, source=regs[args[0]], dest=deref(args[1], regs, stack_info), float=float
     )
 
@@ -612,7 +673,14 @@ def translate_block_body(
         'cfc1': 'mfc1',
     }
 
-    to_write: List[Union[Store, FuncCall]] = []
+    to_write: List[Statement] = []
+    def set_reg(reg, value):
+        if not is_trivial_expr(value):
+            type = 'float' if reg.is_float_reg() else 'int'
+            value = EvalOnceExpr(value, var=stack_info.temp_var_generator(reg.register_name, type))
+            to_write.append(EvalOnceStmt(value))
+        regs[reg] = value
+
     subroutine_args: List[Tuple[Expression, int]] = []
     branch_condition: Optional[Expression] = None
     for instr in block.instructions:
@@ -645,11 +713,13 @@ def translate_block_body(
                     stack_info.add_local_var(to_store.dest)
                 # This needs to be written out.
                 to_write.append(to_store)
+
+                # TODO: figure something out here
                 # If the expression is used again, read it from memory instead of
                 # duplicating it -- duplicated C expressions are probably rare,
                 # and the expression might be invalidated sooner (e.g. if it
                 # refers to the store destination).
-                if not isinstance(to_store.source, NumberLiteral):
+                if False and not isinstance(to_store.source, NumberLiteral):
                     regs.replace_occurrences(to_store.source, to_store.dest)
                     subroutine_args = [
                         (replace_occurrences(val, to_store.source, to_store.dest), pos)
@@ -658,7 +728,7 @@ def translate_block_body(
         elif mnemonic in cases_source_first_register:
             # Just 'mtc1'. It's reversed, so we have to specially handle it.
             assert isinstance(args[1], Register)  # could also assert float register
-            regs[args[1]] = cases_source_first_register[mnemonic](args)
+            set_reg(args[1], cases_source_first_register[mnemonic](args))
 
         elif mnemonic in cases_branches:
             assert branch_condition is None
@@ -702,22 +772,23 @@ def translate_block_body(
                 subroutine_args = []
 
                 call = FuncCall(args[0].symbol_name, func_args)
-                # TODO: It doesn't make sense to put this function call in
-                # to_write in all cases, since sometimes it's just the
-                # return value which matters.
-                to_write.append(call)
+                call_temp = EvalOnceExpr(call, var=stack_info.temp_var_generator('ret', '???'))
+
                 # Clear out caller-save registers, for clarity and to ensure
                 # that argument regs don't get passed into the next function.
                 regs.clear_caller_save_regs()
+
                 # We don't know what this function's return register is,
                 # be it $v0, $f0, or something else, so this hack will have
                 # to do. (TODO: handle it...)
-                regs[Register('f0')] = call
-                regs[Register('v0')] = call
-                regs[Register('return_reg')] = call
+                regs[Register('f0')] = call_temp
+                regs[Register('v0')] = call_temp
+
+                # Write out the function call
+                to_write.append(FuncCallStmt(call_temp))
 
         elif mnemonic in cases_float_comp:
-            regs[Register('condition_bit')] = cases_float_comp[mnemonic](args)
+            set_reg(Register('condition_bit'), cases_float_comp[mnemonic](args))
 
         elif mnemonic in cases_special:
             assert isinstance(args[0], Register)
@@ -729,14 +800,16 @@ def translate_block_body(
                 # Keep track of all local variables.
                 stack_info.add_local_var(res.expr)
 
-            regs[args[0]] = res
+            set_reg(args[0], res)
 
         elif mnemonic in cases_hi_lo:
-            regs[Register('hi')], regs[Register('lo')] = cases_hi_lo[mnemonic](args)
+            hi, lo = cases_hi_lo[mnemonic](args)
+            set_reg(Register('hi'), hi)
+            set_reg(Register('lo'), lo)
 
         elif mnemonic in cases_destination_first:
             assert isinstance(args[0], Register)
-            regs[args[0]] = cases_destination_first[mnemonic](args)
+            set_reg(args[0], cases_destination_first[mnemonic](args))
 
         else:
             assert False, f"I don't know how to handle {mnemonic}!"
