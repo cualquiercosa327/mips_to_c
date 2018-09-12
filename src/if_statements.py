@@ -372,5 +372,10 @@ def write_function(function_info: FunctionInfo) -> None:
     for local_var in function_info.stack_info.local_vars:
         var_type = type_to_str(get_type(local_var))
         print(Statement(4, f'{var_type} {local_var};'))
+    for temp_var in function_info.stack_info.temp_vars:
+        if temp_var.need_decl():
+            var_type = type_to_str(get_type(temp_var.expr))
+            print(Statement(4, f'{var_type} {temp_var.expr.get_var_name()};'))
+    print()
     print(body)
     print('}')

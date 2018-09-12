@@ -41,6 +41,7 @@ class StackInfo:
     callee_save_reg_locations: Dict[Register, int] = attr.ib(factory=dict)
     local_vars: List['LocalVar'] = attr.ib(factory=list)
     arguments: List['PassedInArg'] = attr.ib(factory=list)
+    temp_vars: List['EvalOnceStmt'] = attr.ib(factory=list)
     temp_name_counter: Dict[str, int] = attr.ib(factory=dict)
     stack_types: Dict[int, Optional[str]] = attr.ib(factory=dict)
 
@@ -325,14 +326,16 @@ class WrapperExpr:
 class EvalOnceStmt:
     expr: EvalOnceExpr = attr.ib()
 
+    def need_decl(self) -> bool:
+        return self.expr.num_usages > 1
+
     def should_write(self) -> bool:
         return self.expr.needs_var()
 
     def __str__(self) -> str:
         if self.expr.exact and self.expr.num_usages == 0:
             return f'{self.expr.wrapped_expr};'
-        type = get_type(self.expr.wrapped_expr)
-        return f'{type_to_str(type)} {self.expr.get_var_name()} = {self.expr.wrapped_expr};'
+        return f'{self.expr.get_var_name()} = {self.expr.wrapped_expr};'
 
 @attr.s
 class FuncCallStmt:
@@ -874,7 +877,9 @@ def translate_block_body(
         if value is not None and not is_trivial_expr(value):
             value = EvalOnceExpr(value, exact=False,
                     var=stack_info.temp_var_generator(reg.register_name))
-            to_write.append(EvalOnceStmt(value))
+            stmt = EvalOnceStmt(value)
+            stack_info.temp_vars.append(stmt)
+            to_write.append(stmt)
         if isinstance(value, PassedInArg):
             # Wrap the argument to better distinguish arguments we are called
             # with from arguments passed to subroutines.
