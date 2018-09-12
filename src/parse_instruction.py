@@ -43,7 +43,7 @@ class NumberLiteral:
     value: int = attr.ib()
 
     def __str__(self):
-        return hex(self.value)
+        return hex(self.value) if abs(self.value) >= 10 else str(self.value)
 
 @attr.s(frozen=True)
 class AddressMode:

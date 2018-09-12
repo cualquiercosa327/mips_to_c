@@ -119,7 +119,7 @@ def normalize_likely_branches(function: Function) -> Function:
 
 
 def prune_unreferenced_labels(function: Function) -> Function:
-    labels_used : Set[str] = set()
+    labels_used : Set[str] = set(l.name for l in function.jumptable_labels)
     for item in function.body:
         if isinstance(item, Instruction) and item.is_branch_instruction():
             labels_used.add(item.get_branch_target().target)
@@ -189,9 +189,9 @@ def simplify_standard_patterns(function: Function) -> Function:
         bnez = typing.cast(Instruction, actual[0])
         bne1 = typing.cast(Instruction, actual[5])
         bne2 = typing.cast(Instruction, actual[7])
-        if (bnez.get_branch_target().target == label1.name or
-                bne1.get_branch_target().target == label2.name and
-                bne2.get_branch_target().target == label2.name):
+        if (bnez.get_branch_target().target != label1.name or
+                bne1.get_branch_target().target != label2.name or
+                bne2.get_branch_target().target != label2.name):
             return None
         return ([], i + len(div_pattern) - 1)
 

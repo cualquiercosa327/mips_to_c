@@ -25,7 +25,7 @@ class IfElseStatement:
     def __str__(self):
         space = ' ' * self.indent
         if_str = '\n'.join([
-            f'{space}if ({(self.condition.simplify())})',
+            f'{space}if ({simplify_expr(self.condition)})',
             f'{space}{{',
             str(self.if_body),  # has its own indentation
             f'{space}}}',
@@ -69,7 +69,7 @@ class Body:
         self.statements.append(if_else)
 
     def __str__(self):
-        return '\n'.join([str(statement) for statement in self.statements])
+        return '\n'.join(str(statement) for statement in self.statements)
 
 
 def build_conditional_subgraph(
@@ -91,7 +91,7 @@ def build_conditional_subgraph(
         # If the conditional edge isn't real, then the "fallthrough_edge" is
         # actually within the inner if-statement. This means we have to negate
         # the fallthrough edge and go down that path.
-        if_condition = if_block_info.branch_condition.negated()
+        if_condition = negate(if_block_info.branch_condition)
         if_body = build_flowgraph_between(context, start.fallthrough_edge, end, indent + 4)
     elif start.fallthrough_edge == end:
         # Only an if block, so this is easy.
@@ -107,7 +107,7 @@ def build_conditional_subgraph(
             # Both an if and an else block are present. We should write them in
             # chronological order (based on the original MIPS file). The
             # fallthrough edge will always be first, so write it that way.
-            if_condition = if_block_info.branch_condition.negated()
+            if_condition = negate(if_block_info.branch_condition)
             if_body = build_flowgraph_between(context, start.fallthrough_edge, end, indent + 4)
             else_body = build_flowgraph_between(context, start.conditional_edge, end, indent + 4)
         else:  # multiple conditions in if-statement
@@ -235,15 +235,13 @@ def get_number_of_if_conditions(context, node, curr_end):
 def join_conditions(conditions, op: str, only_negate_last: bool):
     assert op in ['&&', '||']
     final_cond = None
-    for cond in conditions:
-        if not only_negate_last:
-            cond = cond.negated()
+    for i, cond in enumerate(conditions):
+        if not only_negate_last or i == len(conditions)-1:
+            cond = negate(cond)
         if final_cond is None:
             final_cond = cond
         else:
-            final_cond = BinaryOp(final_cond, op, cond)
-    if only_negate_last and final_cond is not None:
-        final_cond.right = final_cond.right.negated()
+            final_cond = BinaryOp(final_cond, op, cond, in_type=None)
     return final_cond
 
 def get_full_if_condition(context, count, start, curr_end, indent):
@@ -290,10 +288,9 @@ def handle_return(
     context: Context, body: Body, return_node: Node, indent: int
 ):
     ret_info = return_node.block.block_info
-    if ret_info and Register('return_reg') in ret_info.final_register_states:
-        ret = ret_info.final_register_states[Register('return_reg')]
+    if ret_info and ret_info.return_reg is not None:
         body.add_statement(Statement(indent,
-            f'// (possible return value: {ret})'))
+            f'// (possible return value: {simplify_expr(ret_info.return_reg)})'))
     else:
         body.add_statement(Statement(indent,
             '// (function likely void)'))
@@ -363,10 +360,17 @@ def write_function(function_info: FunctionInfo) -> None:
     if context.can_reach_return:
         handle_return(context, body, return_node, 4)
 
+    ret_info = return_node.block.block_info
+    ret_type = 'void'
+    if ret_info and ret_info.return_reg:
+        ret_type = type_to_str(get_type(ret_info.return_reg))
+
     fn_name = function_info.stack_info.function.name
-    args = ', '.join(a.declaration_str() for a in function_info.stack_info.arguments)
-    print(f'{fn_name}({args}) {{')
+    arg_exprs = function_info.stack_info.arguments
+    args = ', '.join(a.declaration_str() for a in arg_exprs) or 'void'
+    print(f'{ret_type} {fn_name}({args}) {{')
     for local_var in function_info.stack_info.local_vars:
-        print(f'    (???) {local_var};')
+        var_type = type_to_str(get_type(local_var))
+        print(Statement(4, f'{var_type} {local_var};'))
     print(body)
     print('}')
