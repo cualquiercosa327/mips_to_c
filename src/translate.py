@@ -226,11 +226,6 @@ class Cast:
     def __str__(self) -> str:
         return f'({type_to_str(self.to_type)}) {self.expr}'
 
-@attr.s(frozen=True)
-class Return:
-    def __str__(self) -> str:
-        return 'return'
-
 @attr.s(cmp=False)
 class FuncCall:
     func_name: str = attr.ib()
@@ -279,11 +274,16 @@ class StructAccess:
         return f'{self.struct_var}->unk{format_hex(self.offset)}'
 
 @attr.s(frozen=True)
-class FloatLiteral:
-    val: float = attr.ib()
+class Literal:
+    value: int = attr.ib()
+    type: str = attr.ib(default='int')
 
     def __str__(self) -> str:
-        return str(self.val)
+        if self.type == 'f32':
+            return str(convert_to_float(self.value))
+        if abs(self.value) < 10:
+            return str(self.value)
+        return hex(self.value)
 
 @attr.s(cmp=False)
 class EvalOnceExpr:
@@ -377,8 +377,7 @@ Expression = Union[
     Cast,
     FuncCall,
     GlobalSymbol,
-    NumberLiteral,
-    FloatLiteral,
+    Literal,
     LocalVar,
     PassedInArg,
     StructAccess,
@@ -397,8 +396,8 @@ Statement = Union[
 def is_trivial_expr(expr: Expression) -> bool:
     if isinstance(expr, WrapperExpr):
         return is_trivial_expr(expr.wrapped_expr)
-    trivial_types = [EvalOnceExpr, NumberLiteral, FloatLiteral, GlobalSymbol,
-            LocalVar, PassedInArg, SubroutineArg]
+    trivial_types = [EvalOnceExpr, Literal, GlobalSymbol, LocalVar,
+            PassedInArg, SubroutineArg]
     return expr is None or any(isinstance(expr, t) for t in trivial_types)
 
 def simplify_expr(expr: Expression) -> Expression:
@@ -410,7 +409,7 @@ def simplify_expr(expr: Expression) -> Expression:
         left = simplify_expr(expr.left)
         right = simplify_expr(expr.right)
         if (isinstance(left, BinaryOp) and left.is_boolean() and
-                right == NumberLiteral(0)):
+                right == Literal(0)):
             if expr.op == '==':
                 return simplify_expr(negate(left))
             if expr.op == '!=':
@@ -454,10 +453,8 @@ def get_type(expr: Expression) -> Optional[str]:
         return expr.to_type
     if isinstance(expr, GlobalSymbol):
         return 'void*'
-    if isinstance(expr, NumberLiteral):
-        return 's32'
-    if isinstance(expr, FloatLiteral):
-        return 'f32'
+    if isinstance(expr, Literal):
+        return expr.type
     if isinstance(expr, LocalVar) or isinstance(expr, PassedInArg):
         return expr.stack_info.get_stack_type(expr)
     return None
@@ -551,72 +548,6 @@ class RegInfo:
         return ', '.join(f"{k}: {v}" for k,v in sorted(self.contents.items()))
 
 
-def deref(arg: Argument, regs: RegInfo, stack_info: StackInfo, type: Optional[str]) -> Expression:
-    if isinstance(arg, AddressMode):
-        if arg.lhs is None:
-            location = 0
-        else:
-            assert isinstance(arg.lhs, NumberLiteral)  # macros were removed
-            location = arg.lhs.value
-        if arg.rhs.register_name == 'sp':
-            return stack_info.get_stack_var(location, type=type)
-        else:
-            # Struct member is being dereferenced.
-            return StructAccess(struct_var=regs[arg.rhs], offset=location, type=type)
-    else:
-        # Keep GlobalSymbol's as-is.
-        assert isinstance(arg, GlobalSymbol)
-        return arg
-
-def literal_expr(arg: Argument) -> Expression:
-    if isinstance(arg, GlobalSymbol) or isinstance(arg, NumberLiteral):
-        return arg
-    assert isinstance(arg, BinOp)
-    return BinaryOp(left=literal_expr(arg.lhs), op=arg.op,
-            right=literal_expr(arg.rhs), in_type='int')
-
-def load_upper(args: List[Argument], regs: RegInfo) -> Expression:
-    if isinstance(args[1], BinOp):
-        # Something like "lui REG (lhs >> 16)". Just take "lhs".
-        assert args[1].op == '>>'
-        assert args[1].rhs == NumberLiteral(16)
-        return literal_expr(args[1].lhs)
-    elif isinstance(args[1], NumberLiteral):
-        # Something like "lui 0x1", meaning 0x10000. Shift left and return.
-        return BinaryOp(left=args[1], op='<<', right=NumberLiteral(16), in_type='int')
-    else:
-        # Something like "lui REG %hi(arg)", but we got rid of the macro.
-        return literal_expr(args[1])
-
-def handle_ori(args: List[Argument], regs: RegInfo) -> Expression:
-    if isinstance(args[1], BinOp):
-        # Something like "ori REG (lhs & 0xFFFF)". We (hopefully) already
-        # handled this above, but let's put lhs into this register too.
-        assert args[1].op == '&'
-        assert args[1].rhs == NumberLiteral(0xFFFF)
-        return literal_expr(args[1].lhs)
-    else:
-        # Regular bitwise OR.
-        assert isinstance(args[0], Register)
-        return BinaryOp(left=regs[args[0]], op='|', right=literal_expr(args[1]), in_type='int')
-
-def handle_addi(args: List[Argument], regs: RegInfo, stack_info: StackInfo) -> Expression:
-    if len(args) == 2:
-        # Used to be "addi reg1 reg2 %lo(...)", but we got rid of the macro.
-        # Return the former argument of the macro.
-        return literal_expr(args[1])
-    else:
-        assert len(args) == 3
-        assert isinstance(args[1], Register)
-        if args[1].register_name == 'sp':
-            # Adding to sp, i.e. passing an address.
-            assert isinstance(args[2], NumberLiteral)
-            return UnaryOp(op='&', expr=LocalVar(args[2].value, stack_info=stack_info),
-                    in_type=None, type='void*')
-        else:
-            # Regular binary addition.
-            return BinaryOp(left=regs[args[1]], op='+', right=args[2], in_type='int')
-
 @attr.s
 class BlockInfo:
     """
@@ -636,15 +567,116 @@ class BlockInfo:
             f'Final register states: {self.final_register_states}'])
 
 
-def make_store(args: List[Argument], regs: RegInfo, stack_info: StackInfo, type: str) -> Optional[StoreStmt]:
-    assert isinstance(args[0], Register)
-    if (args[0].register_name in (SPECIAL_REGS + ARGUMENT_REGS) and
-            isinstance(args[1], AddressMode) and
-            args[1].rhs.register_name == 'sp'):
+@attr.s
+class InstrArgs:
+    raw_args: List[Argument] = attr.ib()
+    regs: RegInfo = attr.ib(repr=False)
+
+    def reg_ref(self, index: int) -> Register:
+        ret = self.raw_args[index]
+        assert isinstance(ret, Register)
+        return ret
+
+    def reg(self, index: int) -> Expression:
+        return self.regs[self.reg_ref(index)]
+
+    def reg_nouse(self, index: int) -> Expression:
+        return self.regs.get_nouse(self.reg_ref(index))
+
+    def imm(self, index: int) -> Expression:
+        return literal_expr(self.raw_args[index])
+
+    def memory_ref(self, index: int) -> Union[AddressMode, GlobalSymbol]:
+        ret = self.raw_args[index]
+        assert isinstance(ret, AddressMode) or isinstance(ret, GlobalSymbol)
+        return ret
+
+
+def deref(
+    arg: Union[AddressMode, GlobalSymbol],
+    regs: RegInfo,
+    stack_info: StackInfo,
+    type: Optional[str]
+) -> Expression:
+    if isinstance(arg, AddressMode):
+        if arg.lhs is None:
+            location = 0
+        else:
+            assert isinstance(arg.lhs, NumberLiteral)  # macros were removed
+            location = arg.lhs.value
+        if arg.rhs.register_name == 'sp':
+            return stack_info.get_stack_var(location, type=type)
+        else:
+            # Struct member is being dereferenced.
+            return StructAccess(struct_var=regs[arg.rhs], offset=location, type=type)
+    else:
+        # Keep GlobalSymbol's as-is.
+        assert isinstance(arg, GlobalSymbol)
+        return arg
+
+def literal_expr(arg: Argument) -> Expression:
+    if isinstance(arg, GlobalSymbol):
+        return arg
+    if isinstance(arg, NumberLiteral):
+        return Literal(arg.value)
+    if isinstance(arg, BinOp):
+        return BinaryOp(left=literal_expr(arg.lhs), op=arg.op,
+                right=literal_expr(arg.rhs), in_type='int')
+    assert False, f'argument {arg} must be a literal'
+
+def load_upper(args: InstrArgs, regs: RegInfo) -> Expression:
+    expr = args.imm(1)
+    if isinstance(expr, BinaryOp) and expr.op == '>>':
+        # Something like "lui REG (lhs >> 16)". Just take "lhs".
+        assert expr.right == Literal(16)
+        return expr.left
+    elif isinstance(expr, Literal):
+        # Something like "lui 0x1", meaning 0x10000. Shift left and return.
+        return BinaryOp(left=expr, op='<<', right=Literal(16), in_type='int')
+    else:
+        # Something like "lui REG %hi(arg)", but we got rid of the macro.
+        return expr
+
+def handle_ori(args: InstrArgs, regs: RegInfo) -> Expression:
+    expr = args.imm(1)
+    if isinstance(expr, BinaryOp):
+        # Something like "ori REG (lhs & 0xFFFF)". We (hopefully) already
+        # handled this above, but let's put lhs into this register too.
+        assert expr.op == '&'
+        assert expr.right == Literal(0xFFFF)
+        return expr.left
+    else:
+        # Regular bitwise OR.
+        return BinaryOp(left=args.reg(0), op='|', right=expr, in_type='int')
+
+def handle_addi(args: InstrArgs, regs: RegInfo, stack_info: StackInfo) -> Expression:
+    if len(args.raw_args) == 2:
+        # Used to be "addi reg1 reg2 %lo(...)", but we got rid of the macro.
+        # Return the former argument of the macro.
+        return args.imm(1)
+    else:
+        assert len(args.raw_args) == 3
+        if args.reg_ref(1).register_name == 'sp':
+            # Adding to sp, i.e. passing an address.
+            lit = args.imm(2)
+            assert isinstance(lit, Literal)
+            return UnaryOp(op='&', expr=LocalVar(lit.value, stack_info=stack_info),
+                    in_type=None, type='void*')
+        else:
+            # Regular binary addition.
+            return BinaryOp(left=args.reg(1), op='+', right=args.imm(2), in_type='int')
+
+def make_store(args: InstrArgs, stack_info: StackInfo, type: str) -> Optional[StoreStmt]:
+    source_reg = args.reg_ref(0)
+    source_val = args.reg(0)
+    target = args.memory_ref(1)
+    if (source_reg.register_name in (SPECIAL_REGS + ARGUMENT_REGS) and
+            isinstance(target, AddressMode) and
+            target.rhs.register_name == 'sp'):
         # TODO: This isn't really right, but it helps get rid of some pointless stores.
         return None
     return StoreStmt(
-        source=regs[args[0]], dest=deref(args[1], regs, stack_info, type=type), type=type
+        source=source_val, dest=deref(target, args.regs, stack_info, type=type), type=type
     )
 
 def convert_to_float(num: int):
@@ -656,12 +688,6 @@ def convert_to_float(num: int):
     expo = dec(rep[1:9])
     frac = dec(rep[9:])
     return ((-1) ** sign) * (2 ** (expo - 127)) * (frac / (2 ** 23) + 1)
-
-def handle_mtc1(source: Expression) -> Expression:
-    if isinstance(source, NumberLiteral):
-        return FloatLiteral(convert_to_float(source.value))
-    else:
-        return source
 
 def strip_macros(arg: Argument) -> Argument:
     if isinstance(arg, Macro):
@@ -680,49 +706,56 @@ def translate_block_body(
     Given a block and current register contents, return a BlockInfo containing
     the translated AST for that block.
     """
-    cases_source_first_expression = {
+
+    InstrMap = Dict[str, Callable[[InstrArgs], Expression]]
+    StoreInstrMap = Dict[str, Callable[[InstrArgs], Optional[StoreStmt]]]
+    MaybeInstrMap = Dict[str, Callable[[InstrArgs], Optional[Expression]]]
+    PairInstrMap = Dict[str, Callable[[InstrArgs], Tuple[Optional[Expression], Optional[Expression]]]]
+
+    cases_source_first_expression: StoreInstrMap = {
         # Storage instructions
-        'sb': lambda a: make_store(a, regs, stack_info, type='s8'),
-        'sh': lambda a: make_store(a, regs, stack_info, type='s16'),
-        'sw': lambda a: make_store(a, regs, stack_info, type='int'),
+        'sb': lambda a: make_store(a, stack_info, type='s8'),
+        'sh': lambda a: make_store(a, stack_info, type='s16'),
+        'sw': lambda a: make_store(a, stack_info, type='int'),
         # Floating point storage/conversion
-        'swc1': lambda a: make_store(a, regs, stack_info, type='f32'),
-        'sdc1': lambda a: make_store(a, regs, stack_info, type='f64'),
+        'swc1': lambda a: make_store(a, stack_info, type='f32'),
+        'sdc1': lambda a: make_store(a, stack_info, type='f64'),
     }
-    cases_source_first_register = {
+    cases_source_first_register: InstrMap = {
         # Floating point moving instruction
-        'mtc1': lambda a: handle_mtc1(regs.get_nouse(a[0])),
+        'mtc1': lambda a: a.reg_nouse(0),
     }
-    cases_branches = {  # TODO! These are wrong.
+    cases_branches: MaybeInstrMap = {
         # Branch instructions/pseudoinstructions
+        # TODO! These are wrong. (Are they??)
         'b': lambda a: None,
-        'beq': lambda a:  BinaryOp(left=regs[a[0]], op='==', right=regs[a[1]], in_type=None),
-        'bne': lambda a:  BinaryOp(left=regs[a[0]], op='!=', right=regs[a[1]], in_type=None),
-        'beqz': lambda a: BinaryOp(left=regs[a[0]], op='==', right=NumberLiteral(0), in_type='s32'),
-        'bnez': lambda a: BinaryOp(left=regs[a[0]], op='!=', right=NumberLiteral(0), in_type='s32'),
-        'blez': lambda a: BinaryOp(left=regs[a[0]], op='<=', right=NumberLiteral(0), in_type='s32'),
-        'bgtz': lambda a: BinaryOp(left=regs[a[0]], op='>',  right=NumberLiteral(0), in_type='s32'),
-        'bltz': lambda a: BinaryOp(left=regs[a[0]], op='<',  right=NumberLiteral(0), in_type='s32'),
-        'bgez': lambda a: BinaryOp(left=regs[a[0]], op='>=', right=NumberLiteral(0), in_type='s32'),
+        'beq': lambda a:  BinaryOp(left=a.reg(0), op='==', right=a.reg(1), in_type=None),
+        'bne': lambda a:  BinaryOp(left=a.reg(0), op='!=', right=a.reg(1), in_type=None),
+        'beqz': lambda a: BinaryOp(left=a.reg(0), op='==', right=Literal(0), in_type='s32'),
+        'bnez': lambda a: BinaryOp(left=a.reg(0), op='!=', right=Literal(0), in_type='s32'),
+        'blez': lambda a: BinaryOp(left=a.reg(0), op='<=', right=Literal(0), in_type='s32'),
+        'bgtz': lambda a: BinaryOp(left=a.reg(0), op='>',  right=Literal(0), in_type='s32'),
+        'bltz': lambda a: BinaryOp(left=a.reg(0), op='<',  right=Literal(0), in_type='s32'),
+        'bgez': lambda a: BinaryOp(left=a.reg(0), op='>=', right=Literal(0), in_type='s32'),
     }
-    cases_float_branches = {
+    cases_float_branches: MaybeInstrMap = {
         # Floating-point branch instructions
         # We don't have to do any work here, since the condition bit was already set.
         'bc1t': lambda a: None,
         'bc1f': lambda a: None,
     }
-    cases_jumps = {
+    cases_jumps: MaybeInstrMap = {
         # Unconditional jumps
-        'jal': lambda a: a[0],  # not sure what arguments!
-        'jr':  lambda a: Return()  # not sure what to return!
+        'jal': lambda a: a.imm(0),  # not sure what arguments!
+        'jr':  lambda a: None       # not sure what to return!
     }
-    cases_float_comp = {
+    cases_float_comp: InstrMap = {
         # Floating point comparisons
-        'c.eq.s': lambda a: BinaryOp(left=regs[a[0]], op='==', right=regs[a[1]], in_type='f32'),
-        'c.le.s': lambda a: BinaryOp(left=regs[a[0]], op='<=', right=regs[a[1]], in_type='f32'),
-        'c.lt.s': lambda a: BinaryOp(left=regs[a[0]], op='<',  right=regs[a[1]], in_type='f32'),
+        'c.eq.s': lambda a: BinaryOp(left=a.reg(0), op='==', right=a.reg(1), in_type='f32'),
+        'c.le.s': lambda a: BinaryOp(left=a.reg(0), op='<=', right=a.reg(1), in_type='f32'),
+        'c.lt.s': lambda a: BinaryOp(left=a.reg(0), op='<',  right=a.reg(1), in_type='f32'),
     }
-    cases_special = {
+    cases_special: InstrMap = {
         # Handle these specially to get better debug output.
         # These should be unspecial'd at some point by way of an initial
         # pass-through, similar to the stack-info acquisition step.
@@ -730,67 +763,67 @@ def translate_block_body(
         'ori':  lambda a: handle_ori(a, regs),
         'addi': lambda a: handle_addi(a, regs, stack_info),
     }
-    cases_hi_lo = {
+    cases_hi_lo: PairInstrMap = {
         # Div and mul output results to LO/HI registers.
         # Be careful to only read registers once, using get_nouse for one of the reads.
         # TODO: this isn't right, we need a better system for uses
-        'div': lambda a: (BinaryOp(left=regs[a[1]], op='%', right=regs[a[2]], in_type='s32'), # hi
-                          BinaryOp(left=regs.get_nouse(a[1]), op='/',
-                              right=regs.get_nouse(a[2]), in_type='s32')), # lo
+        'div': lambda a: (BinaryOp(left=a.reg(1), op='%', right=a.reg(2), in_type='s32'), # hi
+                          BinaryOp(left=a.reg_nouse(1), op='/',
+                              right=a.reg_nouse(2), in_type='s32')), # lo
         'multu': lambda a: (None, # hi
-            BinaryOp(left=regs[a[0]], op='*', right=regs[a[1]], in_type='int')), # lo
+            BinaryOp(left=a.reg(0), op='*', right=a.reg(1), in_type='int')), # lo
     }
-    cases_destination_first = {
+    cases_destination_first: InstrMap = {
         # Flag-setting instructions
-        'slt': lambda a:  BinaryOp(left=regs[a[1]], op='<', right=regs[a[2]], in_type='int'),
-        'slti': lambda a: BinaryOp(left=regs[a[1]], op='<', right=a[2], in_type='int'),
+        'slt': lambda a:  BinaryOp(left=a.reg(1), op='<', right=a.reg(2), in_type='int'),
+        'slti': lambda a: BinaryOp(left=a.reg(1), op='<', right=a.imm(2), in_type='int'),
         # LRU (non-floating)
-        'addu': lambda a: BinaryOp(left=regs[a[1]], op='+', right=regs[a[2]], in_type='int'),
-        'subu': lambda a: BinaryOp(left=regs[a[1]], op='-', right=regs[a[2]], in_type='int'),
-        'negu': lambda a: UnaryOp(op='-', expr=regs[a[1]], in_type='s32', type='s32'),
-        # Hi/lo register uses (used after division)
+        'addu': lambda a: BinaryOp(left=a.reg(1), op='+', right=a.reg(2), in_type='int'),
+        'subu': lambda a: BinaryOp(left=a.reg(1), op='-', right=a.reg(2), in_type='int'),
+        'negu': lambda a: UnaryOp(op='-', expr=a.reg(1), in_type='s32', type='s32'),
+        # Hi/lo register uses (used after division/multiplication)
         'mfhi': lambda a: regs.get_nouse(Register('hi')),
         'mflo': lambda a: regs.get_nouse(Register('lo')),
         # Floating point arithmetic
-        'div.s': lambda a: BinaryOp(left=regs[a[1]], op='/', right=regs[a[2]], in_type='f32'),
-        'mul.s': lambda a: BinaryOp(left=regs[a[1]], op='*', right=regs[a[2]], in_type='f32'),
+        'div.s': lambda a: BinaryOp(left=a.reg(1), op='/', right=a.reg(2), in_type='f32'),
+        'mul.s': lambda a: BinaryOp(left=a.reg(1), op='*', right=a.reg(2), in_type='f32'),
         # Floating point conversions
-        'cvt.d.s': lambda a: Cast(to_type='f64', expr=regs[a[1]], in_type='f32'),
-        'cvt.s.d': lambda a: Cast(to_type='f32', expr=regs[a[1]], in_type='f64'),
-        'cvt.w.d': lambda a: Cast(to_type='s32', expr=regs[a[1]], in_type='f64'),
-        'cvt.s.u': lambda a: Cast(to_type='f32', expr=regs[a[1]], in_type='u32'),
-        'trunc.w.s': lambda a: Cast(to_type='s32', expr=regs[a[1]], in_type='f32'),
-        'trunc.w.d': lambda a: Cast(to_type='s32', expr=regs[a[1]], in_type='f64'),
+        'cvt.d.s': lambda a: Cast(to_type='f64', expr=a.reg(1), in_type='f32'),
+        'cvt.s.d': lambda a: Cast(to_type='f32', expr=a.reg(1), in_type='f64'),
+        'cvt.w.d': lambda a: Cast(to_type='s32', expr=a.reg(1), in_type='f64'),
+        'cvt.s.u': lambda a: Cast(to_type='f32', expr=a.reg(1), in_type='u32'),
+        'trunc.w.s': lambda a: Cast(to_type='s32', expr=a.reg(1), in_type='f32'),
+        'trunc.w.d': lambda a: Cast(to_type='s32', expr=a.reg(1), in_type='f64'),
         # Bit arithmetic
-        'and': lambda a: BinaryOp(left=regs[a[1]], op='&', right=regs[a[2]], in_type='int'),
-        'or': lambda a:  BinaryOp(left=regs[a[1]], op='^', right=regs[a[2]], in_type='int'),
-        'xor': lambda a: BinaryOp(left=regs[a[1]], op='^', right=regs[a[2]], in_type='int'),
+        'and': lambda a: BinaryOp(left=a.reg(1), op='&', right=a.reg(2), in_type='int'),
+        'or': lambda a:  BinaryOp(left=a.reg(1), op='^', right=a.reg(2), in_type='int'),
+        'xor': lambda a: BinaryOp(left=a.reg(1), op='^', right=a.reg(2), in_type='int'),
 
-        'andi': lambda a: BinaryOp(left=regs[a[1]], op='&',  right=a[2], in_type='int'),
-        'xori': lambda a: BinaryOp(left=regs[a[1]], op='^',  right=a[2], in_type='int'),
-        'sll': lambda a:  BinaryOp(left=regs[a[1]], op='<<', right=a[2], in_type='int'),
-        'sllv': lambda a:  BinaryOp(left=regs[a[1]], op='<<', right=regs[a[2]], in_type='int'),
-        'srl': lambda a:  BinaryOp(left=regs[a[1]], op='>>', right=a[2],
+        'andi': lambda a: BinaryOp(left=a.reg(1), op='&',  right=a.imm(2), in_type='int'),
+        'xori': lambda a: BinaryOp(left=a.reg(1), op='^',  right=a.imm(2), in_type='int'),
+        'sll': lambda a:  BinaryOp(left=a.reg(1), op='<<', right=a.imm(2), in_type='int'),
+        'sllv': lambda a: BinaryOp(left=a.reg(1), op='<<', right=a.reg(2), in_type='int'),
+        'srl': lambda a:  BinaryOp(left=a.reg(1), op='>>', right=a.imm(2),
                 in_type='u32', right_in_type='int'),
-        'srlv': lambda a:  BinaryOp(left=regs[a[1]], op='>>', right=regs[a[2]],
+        'srlv': lambda a:  BinaryOp(left=a.reg(1), op='>>', right=a.reg(2),
                 in_type='u32', right_in_type='int'),
         # Move pseudoinstruction
-        'move': lambda a: regs.get_nouse(a[1]),
+        'move': lambda a: a.reg_nouse(1),
         # Floating point moving instructions
-        'mfc1': lambda a: regs.get_nouse(a[1]),
-        'mov.s': lambda a: regs.get_nouse(a[1]),
-        'mov.d': lambda a: regs.get_nouse(a[1]),
+        'mfc1': lambda a: a.reg_nouse(1),
+        'mov.s': lambda a: a.reg_nouse(1),
+        'mov.d': lambda a: a.reg_nouse(1),
         # Loading instructions
-        'li': lambda a: a[1],
-        'lb': lambda a:  deref(a[1], regs, stack_info, type='s8'),
-        'lh': lambda a:  deref(a[1], regs, stack_info, type='s16'),
-        'lw': lambda a:  deref(a[1], regs, stack_info, type=None),
-        'lbu': lambda a: deref(a[1], regs, stack_info, type='u8'),
-        'lhu': lambda a: deref(a[1], regs, stack_info, type='u16'),
-        'lwu': lambda a: deref(a[1], regs, stack_info, type=None),
+        'li': lambda a: a.imm(1),
+        'lb': lambda a: deref(a.memory_ref(1), regs, stack_info, type='s8'),
+        'lh': lambda a: deref(a.memory_ref(1), regs, stack_info, type='s16'),
+        'lw': lambda a: deref(a.memory_ref(1), regs, stack_info, type=None),
+        'lbu': lambda a: deref(a.memory_ref(1), regs, stack_info, type='u8'),
+        'lhu': lambda a: deref(a.memory_ref(1), regs, stack_info, type='u16'),
+        'lwu': lambda a: deref(a.memory_ref(1), regs, stack_info, type=None),
         # Floating point loading instructions
-        'lwc1': lambda a: deref(a[1], regs, stack_info, type='f32'),
-        'ldc1': lambda a: deref(a[1], regs, stack_info, type='f64'),
+        'lwc1': lambda a: deref(a.memory_ref(1), regs, stack_info, type='f32'),
+        'ldc1': lambda a: deref(a.memory_ref(1), regs, stack_info, type='f64'),
     }
     # TODO!
     cases_repeats = {
@@ -862,9 +895,12 @@ def translate_block_body(
         # HACK: Remove any %hi(...) or %lo(...) macros; we will just put the
         # full value into each intermediate register, because this really
         # doesn't affect program behavior almost ever.
-        args = list(map(strip_macros, instr.args))
-        if mnemonic in ['addi', 'addiu'] and len(args) == 3 and isinstance(instr.args[2], Macro):
-            del args[1]
+        if (mnemonic in ['addi', 'addiu'] and len(instr.args) == 3 and
+                isinstance(instr.args[2], Macro)):
+            mnemonic = 'set_hilo'
+        simpler_args = list(map(strip_macros, instr.args))
+
+        args = InstrArgs(simpler_args, regs)
 
         # Figure out what code to generate!
         if mnemonic in cases_source_first_expression:
@@ -887,7 +923,7 @@ def translate_block_body(
                 # duplicating it -- duplicated C expressions are probably rare,
                 # and the expression might be invalidated sooner (e.g. if it
                 # refers to the store destination).
-                if False and not isinstance(to_store.source, NumberLiteral):
+                if False and not isinstance(to_store.source, Literal):
                     regs.replace_occurrences(to_store.source, to_store.dest)
                     subroutine_args = [
                         (replace_occurrences(val, to_store.source, to_store.dest), pos)
@@ -895,8 +931,7 @@ def translate_block_body(
 
         elif mnemonic in cases_source_first_register:
             # Just 'mtc1'. It's reversed, so we have to specially handle it.
-            assert isinstance(args[1], Register)  # could also assert float register
-            set_reg(args[1], cases_source_first_register[mnemonic](args))
+            set_reg(args.reg_ref(1), cases_source_first_register[mnemonic](args))
 
         elif mnemonic in cases_branches:
             assert branch_condition is None
@@ -915,7 +950,7 @@ def translate_block_body(
 
         elif mnemonic in cases_jumps:
             result = cases_jumps[mnemonic](args)
-            if isinstance(result, Return):
+            if result is None:
                 # Return from the function.
                 assert mnemonic == 'jr'
                 # TODO: Maybe assert ReturnNode?
@@ -923,7 +958,8 @@ def translate_block_body(
             else:
                 # Function call. Well, let's double-check:
                 assert mnemonic == 'jal'
-                assert isinstance(args[0], GlobalSymbol)
+                target = args.imm(0)
+                assert isinstance(target, GlobalSymbol)
                 func_args: List[Expression] = []
                 # At most one of $f12 and $a0 may be passed, and at most one of
                 # $f14 and $a1. We could try to figure out which ones, and cap
@@ -945,7 +981,7 @@ def translate_block_body(
                 # Reset subroutine_args, for the next potential function call.
                 subroutine_args = []
 
-                call = FuncCall(args[0].symbol_name, func_args)
+                call = FuncCall(target.symbol_name, func_args)
                 call_temp = EvalOnceExpr(call, exact=True,
                         var=stack_info.temp_var_generator('ret'))
 
@@ -963,19 +999,22 @@ def translate_block_body(
                 to_write.append(EvalOnceStmt(call_temp))
 
         elif mnemonic in cases_float_comp:
-            set_reg(Register('condition_bit'), cases_float_comp[mnemonic](args))
+            set_reg(Register('condition_bit'),
+                    cases_float_comp[mnemonic](args))
 
         elif mnemonic in cases_special:
-            assert isinstance(args[0], Register)
+            output = args.reg_ref(0)
             res = cases_special[mnemonic](args)
-            if (args[0].register_name != 'sp' and
-                isinstance(res, UnaryOp) and
-                isinstance(res.expr, LocalVar) and
-                res.expr not in stack_info.local_vars):
-                # Keep track of all local variables.
+
+            # Keep track of all local variables that we take addresses of.
+            if (output.register_name != 'sp' and
+                    isinstance(res, UnaryOp) and
+                    res.op == '&' and
+                    isinstance(res.expr, LocalVar) and
+                    res.expr not in stack_info.local_vars):
                 stack_info.add_local_var(res.expr)
 
-            set_reg(args[0], res)
+            set_reg(output, res)
 
         elif mnemonic in cases_hi_lo:
             hi, lo = cases_hi_lo[mnemonic](args)
@@ -983,8 +1022,7 @@ def translate_block_body(
             set_reg(Register('lo'), lo)
 
         elif mnemonic in cases_destination_first:
-            assert isinstance(args[0], Register)
-            set_reg(args[0], cases_destination_first[mnemonic](args))
+            set_reg(args.reg_ref(0), cases_destination_first[mnemonic](args))
 
         else:
             assert False, f"I don't know how to handle {mnemonic}!"
@@ -1050,7 +1088,7 @@ def translate_to_ast(function: Function) -> FunctionInfo:
     stack_info = get_stack_info(function, flow_graph.nodes[0])
 
     initial_regs: Dict[Register, Expression] = {
-        Register('zero'): NumberLiteral(0),
+        Register('zero'): Literal(0, type='zero'),
         Register('a0'): PassedInArg(0, stack_info=stack_info, guessed_type='int'),
         Register('a1'): PassedInArg(1, stack_info=stack_info, guessed_type='int'),
         Register('a2'): PassedInArg(2, stack_info=stack_info, guessed_type=None),
