@@ -2,7 +2,7 @@
 based on a C AST. Based on the pycparser library."""
 
 from collections import defaultdict
-from typing import Any, Dict, Match, Set, List, Tuple, Optional, Union
+from typing import Any, Dict, Iterator, Match, Set, List, Tuple, Optional, Union
 import re
 
 import attr
@@ -32,6 +32,17 @@ class Struct:
     # TODO: bitfields
     size: int = attr.ib()
     align: int = attr.ib()
+
+
+@attr.s
+class Array:
+    subtype: "DetailedStructMember" = attr.ib()
+    subctype: CType = attr.ib()
+    size: int = attr.ib()
+    dim: int = attr.ib()
+
+
+DetailedStructMember = Union[Array, Struct, None]
 
 
 @attr.s
@@ -271,7 +282,7 @@ def parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Struct
 
 def parse_struct_member(
     type: CType, field_name: str, typemap: TypeMap
-) -> Tuple[int, int, Optional[Struct]]:
+) -> Tuple[int, int, DetailedStructMember]:
     type = resolve_typedefs(type, typemap)
     if isinstance(type, PtrDecl):
         return 4, 4, None
@@ -279,8 +290,8 @@ def parse_struct_member(
         if type.dim is None:
             raise DecompFailure(f"Array field {field_name} must have a size")
         dim = parse_constant_int(type.dim)
-        size, align, _ = parse_struct_member(type.type, field_name, typemap)
-        return size * dim, align, None
+        size, align, substr = parse_struct_member(type.type, field_name, typemap)
+        return size * dim, align, Array(substr, type.type, size, dim)
     assert not isinstance(type, FuncDecl), "Struct can not contain a function"
     inner_type = type.type
     if isinstance(inner_type, (ca.Struct, ca.Union)):
@@ -289,6 +300,18 @@ def parse_struct_member(
     # Otherwise it has to be of type Enum or IdentifierType
     size = primitive_size(inner_type)
     return size, size, None
+
+
+def expand_detailed_struct_member(substr: DetailedStructMember, type: CType, size: int) -> Iterator[Tuple[int, str, CType, int]]:
+    yield (0, "", type, size)
+    if isinstance(substr, Struct):
+         for off, sfields in substr.fields.items():
+             for field in sfields:
+                 yield (off, "." + field.name, field.type, field.size)
+    elif isinstance(substr, Array):
+        for i in range(substr.dim):
+            for (off, path, subtype, subsize) in expand_detailed_struct_member(substr.subtype, substr.subctype, substr.size):
+                yield (substr.size * i + off, f"[{i}]" + path, subtype, subsize)
 
 
 def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Struct:
@@ -344,17 +367,8 @@ def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Str
             ssize, salign, substr = parse_struct_member(type, field_name, typemap)
             align = max(align, salign)
             offset = (offset + salign - 1) & -salign
-            fields[offset].append(StructField(type=type, size=ssize, name=decl.name))
-            if substr is not None:
-                for off, sfields in substr.fields.items():
-                    for field in sfields:
-                        fields[offset + off].append(
-                            StructField(
-                                type=field.type,
-                                size=field.size,
-                                name=decl.name + "." + field.name,
-                            )
-                        )
+            for off, path, ftype, fsize in expand_detailed_struct_member(substr, type, ssize):
+                fields[offset + off].append(StructField(type=ftype, size=fsize, name=decl.name + path))
             if is_union:
                 union_size = max(union_size, ssize)
             else:
